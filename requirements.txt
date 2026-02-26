@@ -1,8 +1,8 @@
 # Face Recognition
 insightface>=0.7.3
-onnxruntime-gpu>=1.16.0  # NVIDIA GPU 사용 시
-# onnxruntime>=1.16.0  # CPU 전용 시 위 줄 대신 사용
-# onnxruntime-directml>=1.16.0  # AMD GPU 사용 시 위 줄 대신 사용
+onnxruntime>=1.16.0
+# GPU 가속 필요 시: pip install onnxruntime-gpu>=1.16.0
+# AMD GPU 사용 시: pip install onnxruntime-directml>=1.16.0
 
 # Image Processing
 opencv-python>=4.8.0
@@ -12,7 +12,8 @@ numpy>=1.24.0
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.5.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
 
 # Python Version
 # Python 3.11 권장 (3.9-3.12 호환)
-
