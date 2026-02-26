@@ -93,7 +93,13 @@ def capture_from_camera(max_frames: int = default_config.max_frames, config: App
             f"카메라 연결, 드라이버, 프라이버시 설정을 확인하세요."
         )
 
+    # 카메라 초기 프레임 버리기: 자동 노출/화이트밸런스 안정화
+    for _ in range(config.camera_warmup_frames):
+        camera.read()
+
     try:
+        last_capture_time: float = 0.0  # 마지막 유효 프레임 캡처 시각 (ms)
+
         while len(captured) < max_frames:
             ret, frame = camera.read()
             if not ret:
@@ -115,10 +121,16 @@ def capture_from_camera(max_frames: int = default_config.max_frames, config: App
             
             frame_failure_count = 0
 
+            # 프레임 간격 강제: 유사 프레임 중복 방지
+            current_ms = time.time() * 1000
+            if (current_ms - last_capture_time) < config.frame_interval_ms:
+                continue
+
             try:
                 faces = active_encoder.detect_faces(frame)
                 if len(faces) == 1:
                     captured.append(frame)
+                    last_capture_time = current_ms
                     logger.debug("유효한 얼굴 프레임 캡처 (%d/%d)", len(captured), max_frames)
             except Exception as exc:
                 logger.warning("얼굴 검출 중 오류 발생, 프레임 스킵: %s", exc)
