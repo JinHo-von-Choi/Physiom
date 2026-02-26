@@ -11,7 +11,7 @@
 
 import contextvars
 import threading
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -116,6 +116,30 @@ class ThreadSafeEncoderManager:
 encoder_manager: ThreadSafeEncoderManager = ThreadSafeEncoderManager()
 
 
+def _reject_outliers(
+    embeddings: List[np.ndarray],
+    scores: List[float],
+    threshold: float
+) -> Tuple[List[np.ndarray], List[float]]:
+    """임시 mean과의 cosine이 threshold 미만인 임베딩을 제거."""
+    if len(embeddings) <= 2:
+        return embeddings, scores
+
+    temp_mean = np.mean(np.stack(embeddings), axis=0)
+    norm = np.linalg.norm(temp_mean)
+    if norm < 1e-8:
+        return embeddings, scores
+    temp_mean /= norm
+
+    valid_embs, valid_scores = [], []
+    for emb, score in zip(embeddings, scores):
+        if float(np.dot(emb, temp_mean)) >= threshold:
+            valid_embs.append(emb)
+            valid_scores.append(score)
+
+    return (valid_embs, valid_scores) if valid_embs else (embeddings[:1], scores[:1])
+
+
 def generate_token_from_camera(max_frames: int = default_config.max_frames, config: AppConfig = default_config) -> list[float]:
     """
     <summary>카메라 입력으로부터 대표 임베딩을 생성하는 통합 함수</summary>
@@ -171,17 +195,19 @@ def generate_token_from_camera(max_frames: int = default_config.max_frames, conf
         - FastAPI의 다중 워커/스레드 환경에서도 안전하게 동작
     </remarks>
     """
-    encoder: FaceEncoder         = encoder_manager.get_encoder(config)
-    frames: List[np.ndarray]     = capture_from_camera(max_frames=max_frames, config=config, encoder=encoder)
-    embeddings: List[np.ndarray] = extract_face_embeddings(frames, encoder=encoder)
-    
-    if len(embeddings) == 0:
+    encoder: FaceEncoder     = encoder_manager.get_encoder(config)
+    frames: List[np.ndarray] = capture_from_camera(max_frames=max_frames, config=config, encoder=encoder)
+    embeddings, scores       = extract_face_embeddings(frames, encoder=encoder)
+
+    embeddings, scores = _reject_outliers(embeddings, scores, config.outlier_cosine_threshold)
+
+    if len(embeddings) < config.min_valid_frames:
         raise NoValidEmbeddingError(
-            f"캡처한 {len(frames)}개 프레임에서 얼굴 임베딩을 추출하지 못했습니다. "
-            f"정면 얼굴로 재촬영하거나 조명을 개선하세요."
+            f"유효 프레임 부족: {len(embeddings)}개 (최소 {config.min_valid_frames}개 필요). "
+            "정면을 바라보고 재시도하세요."
         )
-    
-    vector: np.ndarray = generate_token_from_embeddings(embeddings, config=config)
+
+    vector: np.ndarray = generate_token_from_embeddings(embeddings, weights=scores, config=config)
     return vector.tolist()
 
 
@@ -247,16 +273,18 @@ def generate_token_from_directory(dir_path: str, max_images: int = default_confi
         - ThreadLocalEncoderManager 사용으로 멀티스레드 환경에서 완전히 안전
     </remarks>
     """
-    encoder: FaceEncoder         = encoder_manager.get_encoder(config)
-    images: List[np.ndarray]     = load_images_from_directory(dir_path=dir_path, max_images=max_images, config=config)
-    embeddings: List[np.ndarray] = extract_face_embeddings(images, encoder=encoder)
-    
-    if len(embeddings) == 0:
+    encoder: FaceEncoder     = encoder_manager.get_encoder(config)
+    images: List[np.ndarray] = load_images_from_directory(dir_path=dir_path, max_images=max_images, config=config)
+    embeddings, scores       = extract_face_embeddings(images, encoder=encoder)
+
+    embeddings, scores = _reject_outliers(embeddings, scores, config.outlier_cosine_threshold)
+
+    if len(embeddings) < config.min_valid_frames:
         raise NoValidEmbeddingError(
-            f"디렉토리의 {len(images)}개 이미지에서 얼굴 임베딩을 추출하지 못했습니다. "
-            f"정면 얼굴 사진을 사용하거나 단일 얼굴만 포함된 이미지를 제공하세요."
+            f"디렉토리의 이미지에서 유효 임베딩 부족: {len(embeddings)}개 "
+            f"(최소 {config.min_valid_frames}개 필요)."
         )
-    
-    vector: np.ndarray = generate_token_from_embeddings(embeddings, config=config)
+
+    vector: np.ndarray = generate_token_from_embeddings(embeddings, weights=scores, config=config)
     return vector.tolist()
 
