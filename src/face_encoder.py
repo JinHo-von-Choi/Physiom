@@ -1,9 +1,23 @@
 """
-<summary>InsightFace 기반 얼굴 검출 및 임베딩 추출 모듈</summary>
-<author>최진호</author>
-<date>2025-12-16</date>
-<version>1.0.0</version>
-<remarks>GPU 우선으로 동작하며 CPU로 자동 폴백한다.</remarks>
+<module_description>
+    InsightFace(ArcFace) 기반 고성능 안면 검출 및 512차원 특징 벡터(Embedding) 추출 엔진.
+</module_description>
+<technical_overview>
+    본 엔진은 현대적인 안면 인식 파이프라인인 SCRFD(Detection)와 ArcFace(Recognition)를 통합하여 구현되었습니다.
+    입력 이미지로부터 안면 영역을 정밀하게 추출하고, 정렬(Alignment) 과정을 거쳐 고유한 특징을 512차원의 
+    L2 정규화된 유클리드 공간 벡터로 사상(Mapping)합니다. 이를 통해 코사인 유사도 연산만으로 
+    객체 간의 동일성 여부를 고속으로 판별할 수 있는 기반을 제공합니다.
+</technical_overview>
+<architectural_design>
+    1. 하드웨어 가속 전략: CUDA(NVIDIA), DirectML(AMD/Intel) 프로바이더를 우선 탐색하며, 가용 불가 시 
+       CPU 런타임으로 자동 전환되는 폴백(Fallback) 메커니즘을 내장함.
+    2. 전처리 및 품질 보증: Laplacian 기반 선명도 검사(FIQA)를 수행하여 저품질 데이터에 의한 
+       오인식(False Acceptance) 가능성을 사전에 차단함.
+    3. 지능형 객체 선정: 다중 안면 검출 시 바운딩 박스의 면적을 기준으로 지배적 객체(Dominant Subject)를 
+       자동 선정하여 단일 토큰 생성의 일관성을 확보함.
+</architectural_design>
+<author>최진호 (Senior Principal Software Engineer / Computer Science PhD)</author>
+<version>2.2.0</version>
 """
 
 import logging
@@ -13,7 +27,7 @@ import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
 
-from src.config import AppConfig, default_config
+from src.config import AppSettings, default_config
 from src.exceptions import (
     ModelLoadError,
     ModelInferenceError,
@@ -22,284 +36,189 @@ from src.exceptions import (
     InvalidImageFormatError
 )
 
-
+# 표준 로깅 인터페이스: 시스템 가시성(Observability) 확보를 위해 표준 라이브러리 활용
 logger = logging.getLogger("face-encoder")
 logger.setLevel(logging.INFO)
 
 
 class FaceEncoder:
     """
-    <summary>얼굴 검출과 임베딩 생성을 담당하는 클래스</summary>
+    <summary>안면 인식 특징 추출 프로세스를 캡슐화한 핵심 도메인 클래스</summary>
     <remarks>
-    InsightFace(ArcFace) 모델을 활용하여 일관된 임베딩을 생성한다.
-    
-    책임:
-        - 이미지에서 얼굴 검출 (det_10g SCRFD 모델)
-        - 검출된 얼굴로부터 512차원 정규화 임베딩 추출 (w600k_r50 ArcFace 모델)
-        - GPU/CPU 프로바이더 자동 선택 및 폴백
-    
-    성능 특성:
-        - GPU(RTX 3060): 단일 이미지 ~50ms
-        - CPU(i7): 단일 이미지 ~200ms
-        - 모델 로딩 초기 비용: ~2초, 메모리 ~2GB
-    
-    스레드 안전성: InsightFace 내부 onnxruntime 세션은 스레드 안전하지 않으므로,
-                   다중 스레드 환경에서는 스레드마다 별도 FaceEncoder 인스턴스 생성 권장.
-    
-    사용 예시:
-        encoder = FaceEncoder(AppConfig(use_gpu=True))
-        image = cv2.imread("face.jpg")
-        embedding, error = encoder.extract_embedding(image)
-        if error is None:
-            print(f"임베딩 차원: {embedding.shape}")
+    본 클래스는 신경망 모델의 생명주기와 추론 로직을 관리합니다. 
+    모델 가중치는 메모리에 상주하며, 요청 시 원자적(Atomic) 추론 작업을 수행합니다.
     </remarks>
     """
 
-    def __init__(self, config: AppConfig = default_config):
+    def __init__(self, config: AppSettings = default_config):
         """
-        <summary>모델 초기화 및 런타임 프로바이더 설정</summary>
-        <param name="config">전역 설정 객체, 미지정 시 default_config 사용</param>
-        <remarks>
-        GPU 사용이 불가할 경우 CPU로 자동 폴백한다.
-        초기화 시 모델 다운로드(~500MB)가 발생할 수 있으므로 인터넷 연결 필요.
-        
-        예외:
-            - onnxruntime 미설치: ImportError
-            - 모델 다운로드 실패: RuntimeError
-            - 메모리 부족: MemoryError
-        
-        부작용:
-            - ~/.insightface/models/ 디렉토리에 모델 캐시 생성
-            - GPU 메모리 할당 (~1.5GB)
-        </remarks>
+        <summary>클래스 생성자: 추론 엔진 초기화</summary>
+        <param name="config">애플리케이션 전역 설정 객체 (의존성 주입 패턴 적용)</param>
         """
-        self.config: AppConfig    = config
-        self.providers: List[str] = self._select_providers()
-        self.app: FaceAnalysis    = self._load_model()
+        self.config: AppSettings   = config
+        self.providers: List[str]  = self._select_providers()
+        self.app: FaceAnalysis     = self._load_model()
 
     def _select_providers(self) -> List[str]:
         """
-        <summary>GPU 사용 가능 여부에 따른 onnxruntime 프로바이더 결정</summary>
-        <returns>우선순위가 적용된 프로바이더 리스트</returns>
+        <summary>가용 하드웨어 가속기(Execution Providers) 판별 및 우선순위 설정</summary>
         <remarks>
-        - use_directml 활성화 시 DmlExecutionProvider를 우선 적용한다.
-        - use_gpu 활성화 시 CUDAExecutionProvider를 우선 적용하고, 실패 시 CPU로 폴백한다.
-        - CPUExecutionProvider는 항상 마지막 안전망으로 포함해 가용성을 보장한다.
+        ONNX Runtime의 Execution Provider 전략을 기반으로 하드웨어 가속 우선순위를 결정합니다.
+        가장 낮은 단계인 CPUExecutionProvider는 가용성 보장을 위해 항상 리스트의 말단에 배치됩니다.
         </remarks>
         """
+        providers = []
         if self.config.use_directml:
-            providers: List[str] = ["DmlExecutionProvider", "CPUExecutionProvider"]
-        elif self.config.use_gpu:
-            providers: List[str] = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        else:
-            providers: List[str] = ["CPUExecutionProvider"]
+            providers.append("DmlExecutionProvider")
+        if self.config.use_gpu:
+            providers.append("CUDAExecutionProvider")
+        
+        providers.append("CPUExecutionProvider")
         return providers
 
     def _load_model(self) -> FaceAnalysis:
         """
-        <summary>InsightFace 모델을 로드하여 FaceAnalysis 인스턴스를 생성</summary>
-        <returns>초기화된 FaceAnalysis 객체</returns>
-        <remarks>
-        - det_size를 고정(640x640)하여 검출 성능의 일관성을 유지한다.
-        - GPU/DirectML 불가 시 CPU로 자동 폴백한다.
-        - 모델 캐시는 InsightFace 기본 경로(~/.insightface)에 저장된다.
-        </remarks>
+        <summary>신경망 모델 로딩 및 연산 그래프 최적화</summary>
+        <returns>검출 및 인식을 위한 FaceAnalysis 통합 객체</returns>
+        <exception cref="ModelLoadError">런타임 패키지 부재 또는 리소스 부족 시 발생</exception>
         """
         try:
-            app: FaceAnalysis = FaceAnalysis(name=self.config.model_name, providers=self.providers)
-            ctx_id: int       = 0 if self.config.use_gpu else -1
-            app.prepare(ctx_id=ctx_id, det_size=(640, 640))
-            logger.info("모델 로딩 성공: %s, providers: %s", self.config.model_name, self.providers)
+            app = FaceAnalysis(
+                name=self.config.model_name,
+                providers=self.providers,
+                allowed_modules=self.config.allowed_modules
+            )
+            ctx_id = 0 if self.config.use_gpu else -1
+            app.prepare(ctx_id=ctx_id, det_size=(self.config.det_size, self.config.det_size))
+
+            # pose 추출 활성화 (1k3d68 모델이 로딩된 경우에만)
+            if self.config.require_pose and 'landmark_3d_68' in app.models:
+                app.models['landmark_3d_68'].require_pose = True
+
+            logger.info(
+                f"Engine Initialized: {self.config.model_name} "
+                f"[Provider: {self.providers[0]}] "
+                f"[det_size: {self.config.det_size}] "
+                f"[modules: {self.config.allowed_modules}]"
+            )
             return app
-        except ImportError as exc:
-            raise ModelLoadError(
-                f"onnxruntime 패키지가 설치되지 않았습니다. "
-                f"'pip install onnxruntime-gpu' 또는 'pip install onnxruntime' 실행 필요."
-            ) from exc
-        except FileNotFoundError as exc:
-            raise ModelLoadError(
-                f"모델 '{self.config.model_name}'을 찾을 수 없습니다. "
-                f"인터넷 연결을 확인하거나 모델명을 검증하세요."
-            ) from exc
-        except MemoryError as exc:
-            raise ModelLoadError(
-                f"메모리 부족으로 모델 로딩 실패. "
-                f"최소 8GB RAM 권장, 현재 사용 가능한 메모리를 확인하세요."
-            ) from exc
         except Exception as exc:
-            raise ModelLoadError(
-                f"모델 로딩 중 예기치 않은 오류 발생: {type(exc).__name__}: {exc}"
-            ) from exc
+            logger.critical(f"Failed to load AI models: {exc}")
+            raise ModelLoadError(f"추론 엔진 기동 실패: {exc}")
+
+    def _is_pose_acceptable(self, face) -> bool:
+        """pitch/yaw 기반 정면 여부 판정 (require_pose=True 시 유효)."""
+        pose = face.get('pose') if hasattr(face, 'get') else getattr(face, 'pose', None)
+        if pose is None:
+            return True  # pose 데이터 없으면 통과
+        pitch, yaw, _roll = pose
+        return abs(yaw) <= self.config.pose_yaw_limit and abs(pitch) <= self.config.pose_pitch_limit
+
+    def compute_quality_score(self, face, image: np.ndarray) -> float:
+        """
+        <summary>프레임 품질 점수 계산 (0.0 ~ 1.0)</summary>
+        det_score(0.6) + laplacian_sharpness(0.4) 가중 합산.
+        """
+        det_score = float(getattr(face, 'det_score', 0.0) or 0.0)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+        sharpness_norm = min(sharpness / 200.0, 1.0)
+        return 0.6 * det_score + 0.4 * sharpness_norm
 
     def detect_faces(self, image: np.ndarray) -> List:
         """
-        <summary>이미지에서 얼굴을 검출한다.</summary>
-        <param name="image">BGR 포맷의 OpenCV 이미지 (HxWx3, uint8)</param>
-        <returns>검출된 Face 객체 리스트 (각 객체는 bbox, kps, normed_embedding 포함)</returns>
+        <summary>이미지 데이터 분석 및 안면 영역 검출</summary>
+        <param name="image">BGR 형식의 다차원 배열 데이터 (HxWx3, uint8)</param>
+        <returns>검출된 객체(InsightFace Face) 리스트</returns>
         <remarks>
-        - 다중 얼굴도 모두 반환하며, 후속 단계에서 필터링한다.
-        - BGR 입력을 가정하므로 RGB 이미지 사용 시 cv2.cvtColor(img, cv2.COLOR_RGB2BGR) 변환 필요.
-        - 검출 신뢰도는 config.detection_threshold로 조정 가능 (기본 0.6).
-        
-        전제 조건:
-            - image는 유효한 numpy.ndarray (shape: HxWx3, dtype: uint8)
-            - 이미지 최소 크기: 32x32 픽셀 권장
-        
-        후행 조건:
-            - 반환된 Face 객체는 InsightFace Face 클래스 인스턴스
-            - 빈 리스트 반환 시 얼굴 미검출을 의미
-        
-        성능:
-            - GPU: 640x640 이미지 기준 ~20ms
-            - CPU: 640x640 이미지 기준 ~100ms
+        추론 전 품질 검사(Sanity Check) 단계:
+        1. 자료형 검증: 데이터 구조의 무결성을 확인하여 런타임 에러 방지.
+        2. 이미지 선명도 분석(FIQA): Laplacian Variance 알고리즘을 사용하여 
+           임계값 미만의 블러(Blur) 이미지를 사전에 필터링함으로써 인식 정합성을 보장함.
         </remarks>
         """
-        if not isinstance(image, np.ndarray):
-            raise InvalidImageFormatError(f"이미지는 numpy.ndarray여야 하지만 {type(image)} 타입입니다.")
-        
-        if image.ndim != 3 or image.shape[2] != 3:
-            raise InvalidImageFormatError(
-                f"이미지는 3채널(BGR)이어야 하지만 shape={image.shape}입니다."
-            )
-        
-        if image.dtype != np.uint8:
-            raise InvalidImageFormatError(
-                f"이미지 dtype은 uint8이어야 하지만 {image.dtype}입니다."
-            )
+        if not isinstance(image, np.ndarray) or image.ndim != 3:
+            raise InvalidImageFormatError("입력 데이터가 유효한 이미지 다차원 배열 형식이 아닙니다.")
         
         try:
-            faces: List = self.app.get(image)
+            # Face Image Quality Assessment (FIQA): 선명도 기반 사전 필터링
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            # 라플라시안 분산은 이미지의 고주파 성분 밀도를 측정함 (낮을수록 블러링이 심함)
+            score = cv2.Laplacian(gray, cv2.CV_64F).var()
+            
+            if score < 50: 
+                logger.warning(f"Low image quality detected (Sharpness: {score:.2f}). Inference aborted.")
+                return []
+
+            # 객체 검출 추론 실행
+            faces = self.app.get(image)
             return faces
         except Exception as exc:
-            raise ModelInferenceError(
-                f"얼굴 검출 중 모델 추론 오류 발생: {type(exc).__name__}: {exc}"
-            ) from exc
+            raise ModelInferenceError(f"Inference processing error: {exc}")
 
-    def extract_embedding(self, image: np.ndarray, raise_on_error: bool = False) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    def extract_embedding(self, image: np.ndarray, raise_on_error: bool = False) -> Tuple[Optional[np.ndarray], Optional[str], float]:
         """
-        <summary>단일 이미지에서 얼굴 임베딩을 추출한다.</summary>
-        <param name="image">BGR 포맷의 OpenCV 이미지 (HxWx3, uint8)</param>
-        <param name="raise_on_error">True시 오류 발생 시 예외 발생, False시 (None, error_code) 반환</param>
-        <returns>
-        성공 시: (np.ndarray[512], None) - 정규화된 임베딩 벡터와 None
-        실패 시: (None, error_code) - None과 오류 코드 문자열 (raise_on_error=False일 때)
-        </returns>
-        <remarks>
-        - 얼굴이 0개 또는 2개 이상이면 None과 오류 코드를 반환한다.
-        - 임베딩 추출 실패 시 "embedding_failed"를 반환하여 호출 측이 로깅/필터링할 수 있게 한다.
-        - raise_on_error=True 설정 시 명확한 예외 발생으로 에러 처리를 강제할 수 있다.
-        
-        오류 코드:
-            - "face_not_found": 얼굴 미검출
-            - "multiple_faces": 2개 이상 얼굴 검출
-            - "embedding_failed": 임베딩 추출 실패 (드물게 발생)
-        
-        전제 조건:
-            - image는 유효한 numpy.ndarray (shape: HxWx3, dtype: uint8, BGR 포맷)
-        
-        후행 조건:
-            - 성공 시 반환된 임베딩은 L2 정규화됨 (np.linalg.norm == 1.0)
-            - 임베딩 shape: (512,), dtype: float32
-        
-        사용 예시:
-            # 방법 1: 오류 코드 반환 (기본)
-            embedding, error = encoder.extract_embedding(image)
-            if error is None:
-                similarity = np.dot(embedding, other_embedding)
-            else:
-                logger.warning(f"추출 실패: {error}")
-            
-            # 방법 2: 예외 발생
-            try:
-                embedding, _ = encoder.extract_embedding(image, raise_on_error=True)
-            except NoFaceDetectedError:
-                print("얼굴을 찾을 수 없습니다.")
-        
-        성능:
-            - GPU: 단일 이미지 ~50ms (검출 + 임베딩)
-            - CPU: 단일 이미지 ~200ms
-        </remarks>
+        <summary>단일 객체에 대한 안면 임베딩 벡터 추출</summary>
+        <param name="image">입력 소스 이미지 데이터</param>
+        <param name="raise_on_error">예외 전파 여부 제어 플래그</param>
+        <returns>(embedding, error_code, quality_score) 튜플. quality_score: 0.0 ~ 1.0</returns>
         """
         try:
-            faces: List = self.detect_faces(image)
-        except (InvalidImageFormatError, ModelInferenceError):
-            if raise_on_error:
-                raise
-            return None, "detection_error"
-        
-        if len(faces) == 0:
-            if raise_on_error:
-                raise NoFaceDetectedError("이미지에서 얼굴을 검출하지 못했습니다.")
-            return None, "face_not_found"
-        
+            faces = self.detect_faces(image)
+        except Exception as exc:
+            if raise_on_error: raise
+            return None, "detection_error", 0.0
+
+        if not faces:
+            if raise_on_error: raise NoFaceDetectedError("객체를 검출하지 못했습니다.")
+            return None, "face_not_found", 0.0
+
         if len(faces) > 1:
-            if raise_on_error:
-                raise MultipleFacesDetectedError(
-                    f"이미지에서 {len(faces)}개의 얼굴이 검출되었습니다. 1개만 허용됩니다."
-                )
-            return None, "multiple_faces"
+            logger.info(f"Multiple subjects ({len(faces)}) detected. Selecting the dominant subject.")
+            faces.sort(key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
 
-        face               = faces[0]
-        embedding: np.ndarray = face.normed_embedding
-        
-        if embedding is None or len(embedding) == 0:
-            if raise_on_error:
-                raise ModelInferenceError("임베딩 추출에 실패했습니다.")
-            return None, "embedding_failed"
-        
-        return embedding, None
+        target_face = faces[0]
+
+        # Pose 필터링
+        if not self._is_pose_acceptable(target_face):
+            if raise_on_error: raise ModelInferenceError("포즈가 허용 범위를 벗어났습니다.")
+            return None, "pose_out_of_range", 0.0
+
+        quality = self.compute_quality_score(target_face, image)
+
+        if quality < self.config.min_quality_score:
+            if raise_on_error: raise ModelInferenceError(f"품질 점수 미달: {quality:.3f}")
+            return None, "quality_too_low", quality
+
+        embedding = target_face.normed_embedding
+
+        if embedding is None:
+            if raise_on_error: raise ModelInferenceError("특징 벡터 추출 실패")
+            return None, "embedding_failed", 0.0
+
+        return embedding, None, quality
+
+    def batch_extract_embeddings(self, images: List[np.ndarray]) -> Tuple[List[np.ndarray], List[float]]:
+        """
+        <summary>다량 이미지 데이터에 대한 배치(Batch) 추론 처리</summary>
+        <returns>(embeddings, quality_scores) 튜플</returns>
+        """
+        valid_embs: List[np.ndarray] = []
+        valid_scores: List[float]    = []
+        for i, img in enumerate(images):
+            emb, err, score = self.extract_embedding(img)
+            if err is None:
+                valid_embs.append(emb)
+                valid_scores.append(score)
+            else:
+                logger.debug(f"Skipping index {i} due to: {err}")
+        return valid_embs, valid_scores
 
 
-def extract_face_embeddings(images: List[np.ndarray], encoder: Optional[FaceEncoder] = None) -> List[np.ndarray]:
+def extract_face_embeddings(images: List[np.ndarray], encoder: Optional[FaceEncoder] = None) -> Tuple[List[np.ndarray], List[float]]:
     """
-    <summary>여러 이미지에서 얼굴 임베딩을 추출하여 리스트로 반환한다.</summary>
-    <param name="images">BGR 포맷 이미지 리스트 (각 이미지는 HxWx3, uint8)</param>
-    <param name="encoder">FaceEncoder 인스턴스, 미지정 시 default_config로 새로 생성</param>
-    <returns>유효한 임베딩 벡터 리스트 (각 임베딩은 shape: (512,), dtype: float32)</returns>
-    <remarks>
-    0개 또는 2개 이상 얼굴이 있는 이미지는 스킵하며 경고 로그만 기록한다.
-    
-    동작 특성:
-        - 얼굴이 정확히 1개 검출된 이미지만 처리
-        - 실패한 이미지는 결과에서 제외되고, 빈 리스트 반환 가능
-        - encoder 파라미터로 모델 재사용 가능 (성능 향상)
-    
-    전제 조건:
-        - images는 비어있지 않은 리스트 (빈 리스트 시 빈 결과 반환)
-        - 각 이미지는 유효한 numpy.ndarray (BGR, HxWx3, uint8)
-    
-    후행 조건:
-        - 반환된 임베딩은 모두 L2 정규화됨
-        - len(embeddings) <= len(images) (필터링으로 인한 감소)
-    
-    사용 예시:
-        # 방법 1: 인코더 자동 생성 (매번 모델 로딩, 느림)
-        embeddings = extract_face_embeddings(images)
-        
-        # 방법 2: 인코더 재사용 (권장)
-        encoder = FaceEncoder(config)
-        embeddings = extract_face_embeddings(images, encoder=encoder)
-        
-        # 평균화
-        if len(embeddings) > 0:
-            mean_embedding = np.mean(embeddings, axis=0)
-    
-    성능:
-        - GPU: 5장 이미지 기준 ~250ms (모델 재사용 시)
-        - CPU: 5장 이미지 기준 ~1000ms
-    
-    로깅:
-        - WARNING: 각 실패한 이미지마다 "이미지 N 처리 스킵: error_code" 출력
-    </remarks>
+    <summary>함수형 인터페이스를 통한 특징 벡터 대량 추출 유틸리티</summary>
+    <returns>(embeddings, quality_scores) 튜플</returns>
     """
-    active_encoder: FaceEncoder   = encoder or FaceEncoder()
-    embeddings: List[np.ndarray]  = []
-
-    for index, image in enumerate(images):
-        embedding, error = active_encoder.extract_embedding(image)
-        if error is not None:
-            logger.warning("이미지 %d 처리 스킵: %s", index, error)
-            continue
-        embeddings.append(embedding)
-    return embeddings
-
+    active_encoder = encoder or FaceEncoder()
+    return active_encoder.batch_extract_embeddings(images)
